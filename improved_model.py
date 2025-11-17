@@ -8,6 +8,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
 import warnings
+import copy
 warnings.filterwarnings('ignore')
 
 # Import PyTorch
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
+from torch.cuda import amp
 
 # Import Torchvision
 import torchvision
@@ -33,11 +35,12 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"Torchvision version: {torchvision.__version__}")
 
 # Setup Device
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-if device == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name()}")
+if device.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CUDA version: {torch.version.cuda}")
+    torch.backends.cudnn.benchmark = True
 
 class Config:
     """Configuration class for hyperparameters"""
@@ -53,16 +56,23 @@ class Config:
     # Model
     NUM_CLASSES = 2
     DROPOUT_RATE = 0.5
+    NUM_WORKERS = min(4, os.cpu_count() or 1)
+    USE_AMP = True
     
     # Early stopping
     PATIENCE = 5
     MIN_DELTA = 0.001
+
+# Helper to ensure transforms stay pickleable on Windows
+def convert_to_rgb(image: Image.Image) -> Image.Image:
+    return image.convert("RGB")
 
 # Enhanced Data Augmentation
 def get_transforms(phase: str):
     """Get data transforms for training and validation"""
     if phase == 'train':
         return transforms.Compose([
+            transforms.Lambda(convert_to_rgb),
             transforms.Resize((Config.IMG_SIZE + 32, Config.IMG_SIZE + 32)),
             transforms.RandomCrop(Config.IMG_SIZE),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -76,6 +86,7 @@ def get_transforms(phase: str):
         ])
     else:
         return transforms.Compose([
+            transforms.Lambda(convert_to_rgb),
             transforms.Resize((Config.IMG_SIZE, Config.IMG_SIZE)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -257,26 +268,34 @@ def train_step(model: nn.Module,
                dataloader: DataLoader, 
                loss_fn: nn.Module, 
                optimizer: torch.optim.Optimizer,
-               device: torch.device) -> Tuple[float, float]:
-    """Enhanced training step with gradient clipping"""
+               device: torch.device,
+               scaler: amp.GradScaler | None = None,
+               amp_enabled: bool = False) -> Tuple[float, float]:
+    """Enhanced training step with gradient clipping and optional AMP"""
     model.train()
     train_loss, train_acc = 0, 0
     
     for X, y in dataloader:
-        X, y = X.to(device), y.to(device)
+        X = X.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         
         # Forward pass
-        y_pred = model(X)
-        loss = loss_fn(y_pred, y)
+        optimizer.zero_grad(set_to_none=True)
+        with amp.autocast(enabled=amp_enabled):
+            y_pred = model(X)
+            loss = loss_fn(y_pred, y)
         
         # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+        if scaler is not None and amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
         # Calculate metrics
         train_loss += loss.item()
@@ -290,7 +309,8 @@ def train_step(model: nn.Module,
 def test_step(model: nn.Module, 
               dataloader: DataLoader, 
               loss_fn: nn.Module, 
-              device: torch.device) -> Tuple[float, float, List, List]:
+              device: torch.device,
+              amp_enabled: bool = False) -> Tuple[float, float, List, List]:
     """Enhanced test step with predictions collection"""
     model.eval()
     test_loss, test_acc = 0, 0
@@ -298,10 +318,12 @@ def test_step(model: nn.Module,
     
     with torch.inference_mode():
         for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             
-            y_pred = model(X)
-            loss = loss_fn(y_pred, y)
+            with amp.autocast(enabled=amp_enabled):
+                y_pred = model(X)
+                loss = loss_fn(y_pred, y)
             
             test_loss += loss.item()
             test_acc += (y_pred.argmax(1) == y).type(torch.float).sum().item()
@@ -337,6 +359,9 @@ def train_model(model: nn.Module,
     
     # Early stopping
     early_stopping = EarlyStopping(patience=Config.PATIENCE, min_delta=Config.MIN_DELTA)
+
+    amp_enabled = device.type == "cuda" and Config.USE_AMP
+    scaler = amp.GradScaler(enabled=amp_enabled)
     
     # Tracking
     results = {
@@ -351,15 +376,20 @@ def train_model(model: nn.Module,
     # Training loop
     start_time = timer()
     
-    for epoch in tqdm(range(epochs), desc="Training Progress"):
+    progress_bar = tqdm(range(epochs), desc="Training Progress", leave=True)
+    for epoch in progress_bar:
         print(f"\nEpoch {epoch+1}/{epochs}")
         print("-" * 50)
-        
+
         # Training
-        train_loss, train_acc = train_step(model, train_dataloader, loss_fn, optimizer, device)
-        
+        epoch_start = timer()
+        train_loss, train_acc = train_step(
+            model, train_dataloader, loss_fn, optimizer, device, scaler=scaler if amp_enabled else None,
+            amp_enabled=amp_enabled
+        )
+
         # Testing
-        test_loss, test_acc, y_true, y_pred = test_step(model, test_dataloader, loss_fn, device)
+        test_loss, test_acc, y_true, y_pred = test_step(model, test_dataloader, loss_fn, device, amp_enabled=amp_enabled)
         
         # Calculate F1 score
         f1 = f1_score(y_true, y_pred, average='weighted')
@@ -382,7 +412,24 @@ def train_model(model: nn.Module,
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
         print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | F1: {f1:.4f}")
         print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
-        
+
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        epoch_time = timer() - epoch_start
+        if device.type == "cuda":
+            alloc = torch.cuda.memory_allocated(device) / (1024 ** 2)
+            reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+            device_monitor = f"GPU Memory: {alloc:.1f}MB allocated / {reserved:.1f}MB reserved"
+        else:
+            device_monitor = "Running on CPU"
+        print(f"Epoch duration: {epoch_time:.2f}s | {device_monitor}")
+
+        progress_bar.set_postfix({
+            "TrainLoss": f"{train_loss:.3f}",
+            "ValLoss": f"{test_loss:.3f}",
+            "ValAcc": f"{test_acc:.3f}",
+            "Time(s)": f"{epoch_time:.1f}"
+        })
+
         # Early stopping check
         if early_stopping(test_loss, model):
             print(f"Early stopping triggered after epoch {epoch+1}")
